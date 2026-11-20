@@ -1,6 +1,7 @@
 # Portuguese and European CB SDR Receiver in Odin with SDRplay 14 Bit
 Listenning to the Citizens Band radio waves in AM, FM and SSB on 40 channels ...
 
+## Description
 A command-line Citizens Band (**Banda do Cidadão — 27 MHz / 11m**) Software-Defined Radio receiver written **in the Odin programming language**, using the workspace's `SDRplay_API_Odin_bindings` (SDRplay API v3.15) and Odin's built-in `vendor:miniaudio` audio library.
 
 Implements the complete **Portuguese (ANACOM QNAF)** and **European Harmonised (CEPT ECC/DEC/(11)03 / ETSI EN 300 433)** 40-channel CB allocation (`26.965 MHz` – `27.405 MHz`) for **AM**, **FM**, and **SSB** (**LSB** and **USB**), featuring:
