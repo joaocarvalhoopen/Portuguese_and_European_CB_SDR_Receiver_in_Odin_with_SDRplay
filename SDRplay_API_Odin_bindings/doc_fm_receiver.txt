@@ -1,0 +1,484 @@
+================================================================================
+  SDRPLAY FM STEREO RECEIVER — ARCHITECTURE AND CODE DOCUMENTATION
+  File: fm_receiver.odin
+================================================================================
+
+1. OVERVIEW
+--------------------------------------------------------------------------------
+
+This file implements a real-time FM broadcast radio receiver using the SDRplay
+RSPdx-R2 hardware and the Odin programming language. It receives I/Q samples
+from the SDR, demodulates FM stereo audio, and plays it through the system
+audio output using the miniaudio library.
+
+Usage:
+    ./sdrplay_bindings_test.exe -fm 97.4   (tune to 97.4 MHz Radio Comercial)
+
+Interactive controls (while running):
+    +  or =   Increase volume by 10%
+    -         Decrease volume by 10%
+    Enter     Quit
+
+The receiver supports stereo decoding with automatic fallback to mono when
+the 19 kHz pilot signal is too weak. It includes automatic gain control
+(AGC) on the SDR hardware and automatic audio normalization to prevent
+saturation and distortion.
+
+
+2. SIGNAL PROCESSING PIPELINE
+--------------------------------------------------------------------------------
+
+The complete signal chain from antenna to speaker:
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                      SDR Hardware (RSPdx-R2)                     │
+  │                                                                  │
+  │  Antenna A → Tuner → 2 MHz ADC → Zero-IF downconversion          │
+  │  → Digital filter (200 kHz BW) → Decimate by 4                   │
+  │  → Output: 500 kS/s complex I/Q (int16 pairs)                    │
+  └───────────────────────────┬──────────────────────────────────────┘
+                              │
+                              │ USB (isochronous transfer)
+                              ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                   SDR Stream Callback (SDR thread)               │
+  │                                                                  │
+  │  For each I/Q sample pair:                                       │
+  │                                                                  │
+  │  1. FM Demodulation                                              │
+  │     Compute phase difference between consecutive samples:        │
+  │     demod = atan2(cross_product, dot_product)                    │
+  │     This extracts the instantaneous frequency deviation.         │
+  │                                                                  │
+  │  2. DC Blocker                                                   │
+  │     Slow one-pole high-pass filter removes tuner LO offset:      │
+  │     dc_avg = α·demod + (1-α)·dc_avg                              │
+  │     demod -= dc_avg                                              │
+  │                                                                  │
+  │  3. Pilot PLL (19 kHz)                                           │
+  │     Mix demodulated signal with local 19 kHz NCO:                │
+  │     pilot_I = demod · cos(ω_pilot)                               │
+  │     pilot_Q = demod · sin(ω_pilot)                               │
+  │     Phase error = -pilot_Q / |pilot|                             │
+  │     Adjust NCO phase: ω_pilot += error · loop_bw                 │
+  │     Track pilot amplitude (smoothed) for stereo detection.       │
+  │                                                                  │
+  │  4. 38 kHz Subcarrier Generation                                 │
+  │     Second NCO at exactly 2× pilot frequency, phase-locked:      │
+  │     Advance by 2× (corrected pilot phase increment)              │
+  │                                                                  │
+  │  5. Stereo Demodulation                                          │
+  │     L+R = demod (baseband, low-passed by deemphasis)             │
+  │     L-R = demod · cos(ω_subcarrier) (DSB-SC, then low-pass)      │
+  │     Apply 75 µs deemphasis to both paths.                        │
+  │                                                                  │
+  │  6. Stereo Combination                                           │
+  │     If pilot amplitude > threshold:                              │
+  │       L = (L+R) + (L-R)                                          │
+  │       R = (L+R) - (L-R)                                          │
+  │     Else (mono fallback):                                        │
+  │       L = R = (L+R)                                              │
+  │                                                                  │
+  │  7. Software Decimation (by 10)                                  │
+  │     Accumulate 10 samples, average → 50 kS/s audio               │
+  │                                                                  │
+  │  8. Audio Normalization (anti-saturation)                        │
+  │     Track peak with fast-attack / slow-decay                     │
+  │     Compute gain = target / peak, smoothed                       │
+  │     Apply: sample *= norm_gain · user_volume                     │
+  │     Hard clip to [-1, +1]                                        │
+  │                                                                  │
+  │  9. Ring Buffer Write                                            │
+  │     Push interleaved L,R to SPSC ring buffer (mutex-protected)   │
+  └───────────────────────────┬──────────────────────────────────────┘
+                              │
+                              │ Ring buffer (131072 stereo frames)
+                              ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                Miniaudio Callback (Audio thread)                 │
+  │                                                                  │
+  │  For each output frame requested by the audio device:            │
+  │  - Read interleaved L,R from ring buffer                         │
+  │  - If buffer empty (underrun), output silence                    │
+  │  - Miniaudio resamples 50 kHz → device native rate automatically │
+  └───────────────────────────┬──────────────────────────────────────┘
+                              │
+                              ▼
+                     Speaker / Headphones
+
+
+3. SAMPLE RATE DESIGN
+--------------------------------------------------------------------------------
+
+The sample rate chain is designed to satisfy two constraints:
+  a) The 38 kHz FM stereo subcarrier must be representable (Nyquist > 38 kHz)
+  b) The final audio rate should be a standard-ish rate for miniaudio
+
+    SDR internal rate:    2,000,000 Hz  (set on the device)
+    Hardware decimation:  ÷ 4
+    SDR output rate:        500,000 Hz  (complex I/Q to callback)
+    Software decimation:  ÷ 10  (boxcar average in callback)
+    Audio output rate:       50,000 Hz  (mono or stereo)
+
+At 500 kS/s, the Nyquist frequency is 250 kHz, which comfortably covers the
+entire FM broadcast baseband spectrum (pilot at 19 kHz, L-R subcarrier at
+38 kHz, RDS at 57 kHz, SCA up to 92 kHz).
+
+The 50 kHz audio output is non-standard but miniaudio handles resampling
+to the device's native rate (typically 44.1 kHz or 48 kHz) automatically.
+
+
+4. FM DEMODULATION (lines 165-177)
+--------------------------------------------------------------------------------
+
+The FM demodulator uses the phase-discriminator method. For each incoming
+complex sample s[n] = I[n] + jQ[n], the instantaneous frequency is the
+phase difference from the previous sample:
+
+    Δφ = arg(s[n] · conj(s[n-1]))
+       = atan2(I[n-1]·Q[n] - Q[n-1]·I[n],   ← cross product (imaginary)
+               I[n]·I[n-1] + Q[n]·Q[n-1])    ← dot product (real)
+
+This is implemented using math.atan2() for numerical stability. The output
+'demod' is the FM demodulated signal (the audio + pilot + subcarriers),
+centered at zero with a range of approximately [-π, +π].
+
+The previous sample (fm_prev_i, fm_prev_q) is stored as f32 for the next
+iteration.
+
+
+5. DC BLOCKER (lines 177-182)
+--------------------------------------------------------------------------------
+
+The FM demodulated signal may have a DC offset due to tuner local oscillator
+frequency error. A slow one-pole high-pass filter removes it:
+
+    dc_avg = α · demod + (1-α) · dc_avg
+    demod -= dc_avg
+
+where α = 0.0002 (very slow, time constant ≈ 5 ms at 500 kS/s).
+
+This preserves the audio band (starting at ~30 Hz) while removing any DC
+component that would otherwise cause clicks or offset in the audio.
+
+
+6. PILOT PLL AND STEREO DECODING (lines 184-230)
+--------------------------------------------------------------------------------
+
+FM stereo broadcast signal structure:
+
+    Baseband = (L+R)                         [0 - 15 kHz, mono audio]
+             + 19 kHz pilot                  [amplitude reference]
+             + (L-R)·cos(2π·38kHz)           [DSB-SC subcarrier]
+             + 57 kHz RDS                    [not decoded here]
+
+6.1 Pilot PLL (lines 171-188)
+
+A phase-locked loop locks a local numerically-controlled oscillator (NCO)
+to the 19 kHz pilot tone. The NCO is represented as a rotating unit vector
+(pilot_cos, pilot_sin) updated each sample by rotation:
+
+    pilot_cos' = pilot_cos·cos(ω) - pilot_sin·sin(ω)
+    pilot_sin' = pilot_sin·cos(ω) + pilot_cos·sin(ω)
+
+where ω = 2π·19000/500000 + phase_correction.
+
+Phase detection: The demodulated signal is mixed with the local oscillator.
+The quadrature component (pilot_Q) is proportional to the phase error:
+
+    pilot_I = demod · pilot_cos
+    pilot_Q = demod · pilot_sin
+    phase_error = -pilot_Q / |pilot|
+
+The loop filter applies a small correction (PLL_LOOP_BW = 0.001) to the
+NCO phase increment, causing it to lock to the incoming pilot.
+
+Pilot amplitude is smoothed (exponential moving average) to detect whether
+a stereo signal is present.
+
+6.2 38 kHz Subcarrier (lines 190-192)
+
+A second NCO generates the 38 kHz subcarrier. Its phase increment is exactly
+twice the (corrected) pilot NCO increment, ensuring perfect frequency and
+phase coherence with the pilot. This is critical for clean L-R demodulation.
+
+6.3 Stereo Demodulation (lines 194-214)
+
+    L+R = demod                    (baseband mono signal)
+    L-R = demod · sub_cos          (multiply by 38 kHz, then low-pass)
+
+The multiplication shifts the L-R signal from 38 kHz DSB-SC down to baseband.
+The deemphasis filter (next step) acts as the low-pass filter.
+
+Deemphasis (75 µs) is applied to both L+R and L-R paths independently to
+match the transmitter's pre-emphasis curve.
+
+Stereo combination:
+    If pilot_amplitude > PILOT_THRESHOLD (0.02):
+        L = (L+R) + (L-R)
+        R = (L+R) - (L-R)
+    Else:
+        L = R = (L+R)    (mono fallback)
+
+The threshold prevents noise amplification when no stereo signal is present.
+
+
+7. SOFTWARE DECIMATION (lines 232-283)
+--------------------------------------------------------------------------------
+
+The 500 kS/s audio is decimated to 50 kS/s by averaging every 10 samples
+(boxcar filter). This is a simple but effective low-pass + decimation:
+
+    accum_l += left
+    accum_r += right
+    count += 1
+    if count >= 10:
+        sample_l = accum_l / 10
+        sample_r = accum_r / 10
+
+The boxcar average provides 10 dB of anti-alias rejection at the Nyquist
+of the output rate (25 kHz), which is sufficient given the deemphasis
+filter's additional 21 dB attenuation at that frequency.
+
+
+8. AUDIO NORMALIZATION (lines 239-283)
+--------------------------------------------------------------------------------
+
+To prevent saturation and distortion (the original problem reported by the
+user), an automatic normalization stage tracks the peak audio level and
+adjusts gain dynamically:
+
+Peak tracking:
+    - Fast attack (NORM_ATTACK = 0.001): When a new peak exceeds the
+      tracked peak, the tracker responds quickly (within ~1 ms at 50 kS/s).
+      This prevents clipping from sudden signal bursts.
+    - Slow decay (NORM_DECAY = 0.00002): When the signal drops, the peak
+      estimate decreases slowly (~50 ms time constant). This prevents
+      gain pumping during quiet passages.
+
+Gain computation:
+    target_gain = NORM_TARGET (0.75) / norm_peak
+    norm_gain = 0.5 · norm_gain + 0.5 · target_gain  (smoothed)
+    Clamp: [0.05, 4.0]
+
+The 0.5 smoothing factor prevents abrupt gain changes that would be audible.
+The target of 0.75 leaves 25% headroom for peaks between normalization updates.
+
+Final output:
+    sample = sample · norm_gain · user_volume
+    Hard clip to [-1, +1] as last-resort safety
+
+User volume is adjustable via + / - keys (see section 11).
+
+
+9. RING BUFFER (lines 83-86, 271-280, 318-333)
+--------------------------------------------------------------------------------
+
+A single-producer single-consumer (SPSC) ring buffer bridges the SDR
+callback thread and the miniaudio callback thread.
+
+    fm_ring_data: [RING_SIZE * 2]f32   — Interleaved L,R samples
+    RING_SIZE = 131072                 — ~2.6 seconds at 50 kHz
+
+    fm_ring_write: u32                 — Write index (SDR callback)
+    fm_ring_read: u32                  — Read index (audio callback)
+    fm_ring_mutex: sync.Mutex          — Protects against concurrent access
+
+Write (SDR callback, lines 271-280):
+    Locks mutex, checks if buffer is full (next_write == read → drop sample),
+    writes interleaved L,R, advances write pointer mod RING_SIZE.
+
+Read (audio callback, lines 318-333):
+    Locks mutex, reads interleaved L,R for each output frame, advances read
+    pointer mod RING_SIZE. On underrun (read == write), outputs silence.
+
+The mutex is used rather than lock-free atomics for simplicity and
+correctness. The critical sections are short (memcpy-like), so contention
+is minimal. The large buffer (2.6 seconds) absorbs jitter.
+
+Note: A drop (buffer full) is acceptable — it causes a brief audio gap
+that is typically inaudible. An underrun (buffer empty) outputs silence,
+which is also brief and inaudible if infrequent.
+
+
+10. SDR CONFIGURATION (lines 472-516)
+--------------------------------------------------------------------------------
+
+The SDR is configured for FM broadcast reception:
+
+    Sample rate:     2,000,000 Hz internal, ÷4 hardware decimation → 500 kS/s
+    Bandwidth:       200 kHz (covers the entire ±75 kHz FM deviation)
+    IF mode:         Zero-IF (direct conversion, I/Q output)
+    LO mode:         Auto (API selects optimal LO frequency)
+    Antenna:         A (50 ohm, SMA connector)
+    Gain reduction:  50 dB initial (AGC takes over)
+    LNA state:       0 (maximum LNA gain)
+    AGC:             Enabled (AGC_CTRL_EN), setpoint = -30 dBfs
+    Decimation:      Enabled, factor=4, wideBandSignal=1
+    DC offset:       DC correction on, IQ balance on
+    DC tuner cal:    Periodic mode (dcCal=3), trackTime=1, refreshRateTime=2048
+    HDR mode:        Off (not needed for FM)
+    Bias-T:          Off
+    RF notch:        Off
+    DAB notch:       Off
+
+The AGC setpoint of -30 dBfs is conservative, leaving headroom to avoid
+ADC saturation on strong signals. The hardware AGC adjusts the LNA state
+and gain reduction automatically based on input signal strength.
+
+The wideBandSignal=1 flag tells the decimation filter that the signal is
+wideband (appropriate for zero-IF mode), which selects a flatter filter
+response.
+
+
+11. MINIAUDIO AUDIO OUTPUT (lines 552-573)
+--------------------------------------------------------------------------------
+
+Audio playback uses the Odin vendor:miniaudio library, which is a binding
+to the miniaudio C library (single-header, included as a static library
+at vendor/miniaudio/lib/miniaudio.a).
+
+Configuration:
+    audio_config = miniaudio.device_config_init(.playback)
+    audio_config.sampleRate = 50000     (our output rate)
+    audio_config.playback.format = .f32 (32-bit float)
+    audio_config.playback.channels = 2  (stereo)
+    audio_config.dataCallback = fm_audio_callback
+
+The device is initialized with miniaudio.device_init(nil, ...) (nil context
+= use default audio backend, which is PulseAudio or ALSA on Linux).
+
+miniaudio automatically resamples from 50 kHz to the audio device's native
+sample rate (typically 44.1 kHz or 48 kHz). The resampler uses a
+high-quality linear-phase FIR filter by default.
+
+The data callback (fm_audio_callback, lines 318-333) is called by miniaudio
+on its own audio thread whenever the output buffer needs more data. It reads
+from the ring buffer, providing stereo float samples in the [-1, +1] range.
+
+
+12. VOLUME CONTROL AND TERMINAL INPUT (lines 75-76, 340-363, 575-647)
+--------------------------------------------------------------------------------
+
+12.1 Volume State (lines 75-76)
+
+    volume: f32 = 1.0         — User-adjustable multiplier (0.0 to 4.0)
+    volume_changed: bool      — Flag (unused but available for optimizations)
+
+The volume is applied in the SDR callback (lines 261-262) as a simple
+multiplication on both L and R channels, after normalization.
+
+12.2 Terminal Raw Mode (lines 343-363)
+
+To read single keypresses (+, -, =) without waiting for Enter, the terminal
+is switched to raw mode using the POSIX stty command:
+
+    term_set_raw():
+        system("stty -echo -icanon min 1 time 0 < /dev/tty")
+        — -echo:   Don't echo typed characters
+        — -icanon: Non-canonical mode (no line buffering)
+        — min 1:   Return after at least 1 character
+        — time 0:  No inter-character timeout
+
+    term_restore():
+        system("stty echo icanon < /dev/tty")
+        — Restores normal terminal behavior
+
+The C system() function is used via a foreign import:
+    foreign import libc "system:c"
+    foreign libc { system :: proc(cmd: cstring) -> c.int --- }
+
+12.3 Keypress Loop (lines 590-647)
+
+After audio starts, the main thread enters a loop reading from /dev/tty:
+
+    + or = : volume += 0.1 (max 4.0 = 400%)
+    -       : volume -= 0.1 (min 0.0 = mute)
+    Enter   : break (quit)
+
+Volume is displayed as a percentage and updated on the same line using
+carriage return (\r).
+
+If raw mode fails (no TTY available, e.g., when piped), the code falls
+back to reading from stdin, where Enter quits.
+
+
+13. CLEANUP AND RESOURCE MANAGEMENT (lines 394-415)
+--------------------------------------------------------------------------------
+
+The start_fm_receiver() function uses Odin's defer mechanism to guarantee
+cleanup in reverse order, even if the function exits early due to an error:
+
+    defer {
+        1. Restore terminal (if raw mode was set)
+        2. Stop and uninitialize miniaudio device
+        3. Uninitialize SDR streaming (sdrplay_api_Uninit)
+        4. Release SDR device (sdrplay_api_ReleaseDevice)
+        5. Close SDR API (sdrplay_api_Close)
+    }
+
+State tracking variables (api_opened, device_selected, streaming, audio_init)
+ensure that only the resources that were actually initialized are cleaned up.
+
+
+14. CALLBACK THREAD SAFETY (lines 155, 289-303)
+--------------------------------------------------------------------------------
+
+The SDR stream callback (fm_stream_callback) runs on a separate thread
+created by the SDRplay API. Two important considerations:
+
+1. Runtime context: The callback sets `context = runtime.default_context()`
+   at the start (line 155) because Odin's allocator and other runtime
+   facilities require a context, which is not automatically available in
+   C-calling-convention callbacks.
+
+2. Event callback: The fm_event_callback uses `#partial switch` to handle
+   only the events it cares about (PowerOverloadChange, DeviceRemoved),
+   ignoring others without error. It cannot use fmt.eprintln() because
+   fmt requires a runtime context that isn't available in the C callback.
+
+
+15. KEY CONSTANTS REFERENCE
+--------------------------------------------------------------------------------
+
+    FM_SDR_FS          = 2,000,000.0   SDR internal sample rate (Hz)
+    FM_SDR_DECIM       = 4              Hardware decimation factor
+    FM_OUTPUT_RATE     = 500,000.0      SDR output rate to callback (Hz)
+    AUDIO_DECIM_FACTOR = 10             Software decimation factor
+    AUDIO_RATE         = 50,000.0       Final audio rate (Hz)
+
+    PILOT_FREQ         = 19,000.0       FM stereo pilot frequency (Hz)
+    SUBCARRIER_FREQ    = 38,000.0       FM stereo subcarrier (Hz)
+
+    DEEMPHASIS_TAU     = 75e-6          Deemphasis time constant (75 µs)
+    DC_ALPHA           = 0.0002          DC blocker coefficient
+    PLL_LOOP_BW        = 0.001           Pilot PLL loop bandwidth
+    PILOT_THRESHOLD    = 0.02            Minimum pilot for stereo
+
+    NORM_ATTACK        = 0.001           Normalization fast-attack coefficient
+    NORM_DECAY         = 0.00002         Normalization slow-decay coefficient
+    NORM_TARGET        = 0.75            Target peak level (75% of full scale)
+    NORM_MIN_GAIN      = 0.05            Minimum normalization gain
+    NORM_MAX_GAIN      = 4.0             Maximum normalization gain
+
+    RING_SIZE          = 131072          Ring buffer frames (stereo pairs)
+
+
+16. FILE STRUCTURE SUMMARY
+--------------------------------------------------------------------------------
+
+    Lines   1-39:    Imports and C library declarations
+    Lines  41-73:    Constants
+    Lines  75-121:   Global state (ring buffer, demod state, PLL, normalization)
+    Lines 127-140:   NCO step function (direct digital synthesis)
+    Lines 146-283:   SDR stream callback (full demodulation pipeline)
+    Lines 289-303:   SDR event callback (overload handling)
+    Lines 309-333:   Miniaudio data callback (ring buffer read)
+    Lines 340-363:   Terminal raw mode setup/restore
+    Lines 369-647:   start_fm_receiver() — main entry point
+
+Total: 648 lines
+
+================================================================================
+  END OF DOCUMENT
+================================================================================

@@ -1,0 +1,399 @@
+================================================================================
+  SDRPLAY API ODIN BINDINGS — HARDWARE TEST SUITE DOCUMENTATION
+  File: sdrplay_test.odin
+================================================================================
+
+1. OVERVIEW
+--------------------------------------------------------------------------------
+
+This file contains a comprehensive hardware integration test suite for the
+SDRplay API Odin bindings. The tests are designed to run against a real
+SDRplay RSPdx-R2 device connected via USB, and they exercise every major
+API function to verify that the bindings are correct.
+
+The tests verify:
+  - API open/close and version checking
+  - Device enumeration and identification
+  - Device selection and parameter retrieval
+  - Struct field read/write (ABI layout verification)
+  - Streaming initialization and sample reception
+  - Runtime parameter updates (frequency, gain, antenna, bandwidth)
+  - Error string lookup
+  - Extended error information retrieval
+  - Device API lock/unlock
+  - Proper cleanup (uninit, release, close)
+
+The test suite is called from main.odin via the single entry point
+run_tests() when no command-line arguments are provided.
+
+
+2. SDRPLAY API LIFECYCLE
+--------------------------------------------------------------------------------
+
+The tests follow the correct SDRplay API lifecycle, which is critical for
+proper operation:
+
+    1. sdrplay_api_Open()           — Connect to the SDRplay service
+    2. sdrplay_api_ApiVersion()     — Verify API version matches (3.15)
+    3. sdrplay_api_GetDevices()     — Enumerate connected hardware
+    4. sdrplay_api_SelectDevice()   — Claim a device for exclusive use
+    5. sdrplay_api_GetDeviceParams()— Get pointer to parameter structs
+    6. Set parameters directly on structs (devParams, rxChannelA, etc.)
+       NOTE: sdrplay_api_Update() must NOT be called before Init.
+       Initial parameters are applied automatically when Init is called.
+    7. sdrplay_api_Init()           — Start streaming with callbacks
+    8. [streaming active]
+       - Modify struct fields, then call sdrplay_api_Update() to apply
+       - Callbacks fire on a separate API thread
+    9. sdrplay_api_Uninit()         — Stop streaming
+   10. sdrplay_api_ReleaseDevice()  — Release the device
+   11. sdrplay_api_Close()          — Disconnect from the service
+
+The test runner enforces this ordering with conditional execution: each test
+only runs if the previous critical test passed, ensuring that the API is in
+the correct state for each subsequent test.
+
+
+3. SHARED STATE AND CALLBACKS (lines 19-93)
+--------------------------------------------------------------------------------
+
+TestState struct (lines 19-30):
+    Shared state accessed from both the main thread and the SDR callback thread:
+    - totalSamples (u64)   — Running count of all I/Q samples received
+    - numCallbacks (u32)   — Number of stream callback invocations
+    - overloadEvents (u32) — Number of power overload events
+    - gainEvents (u32)     — Number of gain change events
+    - minI, maxI (i16)     — Minimum/maximum I sample value (signal presence)
+    - minQ, maxQ (i16)     — Minimum/maximum Q sample value
+    - streamReady (bool)   — Set true on first callback (signals main thread)
+    - deviceRemoved (bool) — Set if device disconnects
+
+Global variables (lines 32-35):
+    - test_state: TestState          — Shared test statistics
+    - test_dev: DeviceT              — Selected device descriptor
+    - test_params: ^DeviceParamsT    — Pointer to device parameters
+    - streaming_active: bool         — Whether streaming is currently active
+
+stream_callback (lines 41-64):
+    C-calling-convention callback invoked by the SDR API on its own thread
+    whenever new I/Q samples are available. Parameters:
+    - xi, xq: [^]i16       — Interleaved I and Q sample arrays (int16)
+    - params: ^StreamCbParamsT — Metadata (sample number, change flags)
+    - numSamples: u32      — Number of samples in this batch
+    - reset: u32            — Whether the stream was reset
+    - cbContext: rawptr     — User-provided context (pointer to TestState)
+
+    The callback:
+    1. Increments totalSamples and numCallbacks
+    2. Sets streamReady = true (signals the main thread that data is flowing)
+    3. Iterates through all samples, tracking min/max of I and Q
+
+    Note: The min/max tracking is used to verify that real signal is being
+    received (not all zeros), which confirms the struct layout and data types
+    are correct.
+
+event_callback (lines 66-93):
+    C-calling-convention callback invoked on event notifications:
+    - PowerOverloadChange: Acknowledges the overload by calling
+      sdrplay_api_Update() with the Ctrl_OverloadMsgAck flag. This is
+      required by the API — failure to acknowledge will stop the stream.
+    - GainChange: Increments the gain event counter
+    - DeviceRemoved: Sets deviceRemoved flag (not expected in normal tests)
+    - RspDuoModeChange, DeviceFailure: Handled but not relevant for RSPdx-R2
+
+
+4. INDIVIDUAL TESTS
+--------------------------------------------------------------------------------
+
+Each test is a function returning bool (true = pass, false = fail). They are
+executed in order by run_tests(), with dependencies enforced.
+
+--- Test 1: Open API and check version (test_open_and_version, line 100) ---
+
+Calls sdrplay_api_Open() to connect to the sdrplay_apiService daemon, then
+sdrplay_api_ApiVersion() to retrieve the version. Verifies the version is
+at least 3.0 (the installed version is 3.15).
+
+If this test fails, the SDRplay service may not be running. Check with:
+    systemctl status sdrplay.service
+
+If the service is stuck (ServiceNotResponding error), restart it:
+    sudo systemctl restart sdrplay.service
+
+--- Test 2: Enumerate devices (test_enumerate_devices, line 122) ---
+
+Calls sdrplay_api_GetDevices() to fill a DeviceT array (up to 16 devices).
+Prints each device's hardware name, version, serial number, and validity flag.
+
+Selection logic:
+  1. Search for an RSPdx-R2 (hwVer == 7) with valid == 1
+  2. If not found, fall back to the first valid device of any type
+  3. If no valid device at all, the test fails
+
+The test stores the selected DeviceT in the global test_dev variable for
+use by subsequent tests.
+
+--- Test 3: Select device and get parameters (test_select_and_params, line 170) ---
+
+Calls sdrplay_api_SelectDevice() to claim the device, then
+sdrplay_api_DebugEnable() with .Disable to turn off debug logging, then
+sdrplay_api_GetDeviceParams() to obtain a pointer to the DeviceParamsT
+structure.
+
+Verifies that the returned pointers are non-nil:
+  - test_params (the top-level pointer)
+  - test_params.devParams (device-level parameters)
+  - test_params.rxChannelA (tuner A parameters — should be non-nil for all
+    single-tuner devices; rxChannelB is nil for non-RSPduo devices)
+
+Prints the memory addresses and the initial samplesPerPkt value (output
+parameter that gets populated after Init).
+
+--- Test 4: Configure device parameters (test_configure, line 205) ---
+
+Sets all device and channel parameters by writing directly to the struct
+fields obtained in Test 3. This is the critical ABI layout test — if any
+Odin struct has a field at the wrong offset or wrong type, the values written
+here will corrupt the C library's internal state.
+
+Configuration applied:
+  Device level (devParams):
+    - fsFreq.fsHz = 2,000,000.0  (2 MHz sample rate)
+    - ppm = 0.0                  (no frequency correction)
+    - rspDxParams.antennaSel = ANTENNA_A
+    - rspDxParams.hdrEnable = 0  (HDR mode off)
+    - rspDxParams.biasTEnable = 0
+    - rspDxParams.rfNotchEnable = 0
+    - rspDxParams.rfDabNotchEnable = 0
+
+  Tuner (rxChannelA.tunerParams):
+    - rfFreq.rfHz = 100,000,000.0  (100 MHz, FM broadcast band)
+    - bwType = BW_0_200           (200 kHz bandwidth)
+    - ifType = IF_Zero            (zero-IF / direct conversion)
+    - loMode = LO_Auto            (automatic LO selection)
+    - gain.gRdB = 50              (50 dB gain reduction)
+    - gain.LNAstate = 0           (LNA state 0)
+    - gain.minGr = NORMAL_MIN_GR
+    - dcOffsetTuner.dcCal = 3     (periodic DC calibration)
+    - dcOffsetTuner.trackTime = 1
+    - dcOffsetTuner.refreshRateTime = 2048
+
+  Control (rxChannelA.ctrlParams):
+    - dcOffset.DCenable = 1       (DC offset correction on)
+    - dcOffset.IQenable = 1       (IQ imbalance correction on)
+    - decimation.enable = 0       (no decimation for tests)
+    - agc.enable = AGC_DISABLE    (manual gain for deterministic testing)
+    - agc.setPoint_dBfs = -30
+    - adsbMode = DECIMATION
+
+  RSPdx tuner params:
+    - rspDxTunerParams.hdrBw = HDRMODE_BW_1_700
+
+After writing, the test reads back 7 fields and verifies they match the
+written values. This confirms the struct layout is correct.
+
+  IMPORTANT: sdrplay_api_Update() is NOT called here. Update must only be
+  called after Init. The initial parameter values are applied automatically
+  when Init is called.
+
+--- Test 5: Init streaming and receive samples (test_streaming, line 270) ---
+
+Creates a CallbackFnsT struct with stream_callback and event_callback, then
+calls sdrplay_api_Init() to start streaming.
+
+The main thread then polls test_state.streamReady (set by the first callback)
+with 10ms sleep intervals, up to a 5-second timeout. Once the first callback
+arrives, the test collects samples for 2 seconds.
+
+Pass criteria:
+  - First callback received within 5 seconds
+  - At least 500,000 samples received (at 2 MHz, 2 seconds = ~4M samples)
+  - I and Q samples are not all zeros (signal presence verified)
+  - minI/maxI/minQ/maxQ show non-zero range
+
+Typical results on the RSPdx-R2:
+  - First callback: ~70 ms after Init
+  - Samples in 2s: ~4,064,256 (4032 callbacks)
+  - I range: [-16379, 28657], Q range: [-16669, 16036]
+
+--- Test 6: Runtime parameter updates (test_runtime_update, line 339) ---
+
+While streaming is active (Test 5 left it running), this test calls
+sdrplay_api_Update() multiple times to change parameters at runtime:
+
+  1. Frequency: 100 MHz → 98.5 MHz  (Update with .Tuner_Frf)
+  2. Gain: 50 dB → 40 dB            (Update with .Tuner_Gr)
+  3. Gain: 40 dB → 50 dB            (Update with .Tuner_Gr, revert)
+  4. Antenna: A → B                 (Update with .RspDx_AntennaControl, ext1)
+  5. Antenna: B → A                 (Update with .RspDx_AntennaControl, revert)
+  6. Bandwidth: 200 kHz → 600 kHz   (Update with .Tuner_BwType)
+  7. Bandwidth: 600 kHz → 200 kHz   (Update with .Tuner_BwType, revert)
+
+Each update is followed by a 200ms sleep to allow the hardware to settle.
+
+This test verifies:
+  - The Update function is bound correctly (parameters in the right order)
+  - The ReasonForUpdateT and ReasonForUpdateExtension1T enums have the
+    correct values (the API checks these internally)
+  - The RSPdx-specific extension flags work (antenna control uses ext1)
+  - The device accepts parameter changes while streaming
+
+--- Test 7: Error string function (test_error_strings, line 398) ---
+
+Calls the error_string() helper with three known error codes:
+  - .Success → "sdrplay_api_Success"
+  - .Fail → "sdrplay_api_Fail"
+  - .InvalidParam → "sdrplay_api_InvalidParam"
+
+Verifies that the strings are non-empty, confirming the GetErrorString
+function pointer is correctly bound.
+
+--- Test 8: GetLastError function (test_last_error, line 415) ---
+
+Calls sdrplay_api_GetLastError() with the device pointer. If no error is
+stored (returns nil), the test passes. If an error struct is returned, it
+reads the null-terminated file, function, and message strings and prints
+them with the line number.
+
+On a clean run, this typically returns nil (no errors stored).
+
+--- Test 9: Lock/Unlock Device API (test_lock_unlock, line 438) ---
+
+Calls sdrplay_api_LockDeviceApi() followed by sdrplay_api_UnlockDeviceApi().
+These functions serialize device access across multiple processes. The test
+verifies both return .Success.
+
+--- Test 10: Cleanup (test_cleanup, line 451) ---
+
+Performs the full shutdown sequence:
+
+  1. sdrplay_api_Uninit() — Stops streaming. If the return is .StopPending
+     (can happen with RSPduo master/slave), retries after 1 second.
+  2. Prints final streaming statistics (total samples, callbacks, overloads,
+     gain events) collected over the entire test run.
+  3. sdrplay_api_ReleaseDevice() — Releases the device claim.
+  4. sdrplay_api_Close() — Disconnects from the service.
+
+If any step fails, all_ok is set to false but cleanup continues (best-effort).
+
+
+5. TEST RUNNER (run_tests, line 495)
+--------------------------------------------------------------------------------
+
+The test runner executes all tests in order with dependency tracking:
+
+  - Tests 1-4 are critical: if any fails, subsequent tests are skipped
+    (the API is not in the correct state)
+  - Tests 5-9 only run if configuration (Test 4) succeeded
+  - Test 6 only runs if streaming (Test 5) is active
+  - Test 10 always runs if the device was selected (even if other tests
+    failed, to ensure proper cleanup)
+
+A running tally of tests_passed and tests_total is maintained. At the end,
+the summary is printed:
+
+    ============================================
+      Results: 10/10 tests passed
+      *** ALL TESTS PASSED ***
+    ============================================
+
+If any test fails, the process exits with code 1 (for scripting integration).
+
+
+6. EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+
+When run against a connected RSPdx-R2 with a healthy service:
+
+    ============================================
+      SDRplay API Odin Bindings — Hardware Test
+    ============================================
+
+    [Test 1] Open API and check version
+      API version: 3.15 (expected 3.15)
+      -> PASS
+
+    [Test 2] Enumerate devices and find RSPdx-R2
+      Found 1 device(s)
+      Device 0: RSPdx-R2 (hwVer=7, serial=XXXXXXXXXXXX, valid=1)
+      Selected device: RSPdx-R2 (hwVer=7)
+      -> PASS
+
+    [Test 3] Select device and get device parameters
+      devParams: 0x7F..., rxChannelA: 0x7F..., rxChannelB: 0x0
+      samplesPerPkt (initial): 0
+      -> PASS
+
+    [Test 4] Configure device parameters (pre-Init)
+      Configured: fs=2MHz, rf=100MHz, bw=200kHz, IF=Zero, gain=50dB, LNA=0, AGC=off
+      Antenna=A, BiasT=off, RFNotch=off, DABNotch=off, HDR=off
+      Struct field verification passed
+      -> PASS
+
+    [Test 5] Init streaming and receive samples (2s)
+      Streaming initialized, waiting for samples...
+      First callback received after 70 ms
+      Samples so far: 4064256 (callbacks: 4032)
+      I range: [-16379, 28657], Q range: [-16669, 16036]
+      Signal presence verified (non-zero I/Q samples)
+      -> PASS
+
+    [Test 6] Runtime parameter updates (freq, gain, antenna, bw)
+      Updated: freq 100->98.5MHz, gain 50<->40, antenna A<->B<->A, bw 200<->600kHz
+      -> PASS
+
+    [Test 7] Error string function
+      Success -> 'sdrplay_api_Success'
+      Fail    -> 'sdrplay_api_Fail'
+      Invalid -> 'sdrplay_api_InvalidParam'
+      -> PASS
+
+    [Test 8] GetLastError function
+      GetLastError: no error stored (OK)
+      -> PASS
+
+    [Test 9] Lock/Unlock Device API
+      Lock/Unlock API OK
+      -> PASS
+
+    [Test 10] Uninit, release device, and close API
+      Total samples: 6871536, callbacks: 6817, overloads: 3, gain events: 10
+      Streaming stopped, device released, API closed
+      -> PASS
+
+    ============================================
+      Results: 10/10 tests passed
+      *** ALL TESTS PASSED ***
+    ============================================
+
+
+7. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+  "ServiceNotResponding" error (Test 1):
+    The sdrplay_apiService daemon is stuck. Restart it:
+      sudo systemctl restart sdrplay.service
+    Wait 2 seconds and retry.
+
+  "No SDRplay devices found" (Test 2):
+    - Check USB connection (look for vendor ID 1df7 in /sys/bus/usb/)
+    - The service may need a restart after USB reconnect
+    - Run the C test at /tmp/sdrplay_c_test to isolate binding vs. service issues
+
+  "NotInitialised" error (Test 4):
+    sdrplay_api_Update() was called before sdrplay_api_Init(). The initial
+    parameters must be set by modifying the struct fields directly — Update
+    is only for runtime changes after Init.
+
+  Streaming callback never fires (Test 5 timeout):
+    - Check that the antenna is connected
+    - The AGC setpoint may be too conservative
+    - Try changing gain.gRdB to a lower value (more gain)
+
+  Tests pass but "overloads" count is high:
+    The input signal is too strong. Increase gain.gRdB (more attenuation) or
+    reduce the antenna signal.
+
+================================================================================
+  END OF DOCUMENT
+================================================================================

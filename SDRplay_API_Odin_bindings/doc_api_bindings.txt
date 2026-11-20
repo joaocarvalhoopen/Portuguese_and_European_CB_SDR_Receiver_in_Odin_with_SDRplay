@@ -1,0 +1,306 @@
+================================================================================
+  SDRPLAY API ODIN BINDINGS — DOCUMENTATION
+  File: sdrplay_api.odin
+================================================================================
+
+1. OVERVIEW
+--------------------------------------------------------------------------------
+
+This file provides complete Odin language bindings for the SDRplay API v3.15,
+a C library that controls SDRplay RSP software-defined radio hardware on Linux.
+The bindings are generated directly from the installed C header files located
+at /usr/include/sdrplay_api*.h, which are part of the SDRplay API package
+(version 3.15) available from SDRplay Ltd.
+The SDRPlay companny say that you have to have a a SDRPlay to use there API,
+I have more then one SDRPlays, for my experiments.
+You have to install the API on you Linux system before using this bindings,
+this are only the bindings and dont come with the API.
+The License of this bindings is MIT Open Source License and is only for this
+bindings that I have made not for the SDRPlay API, consult there license and
+terms of use and see if you can use it.
+
+SDRPlay gives publically a document that you should read that explains there
+API public interface. The document is the following:
+
+SDRplay_API_Specification_v3.15.pdf
+
+I use the Odin language so I needed to have bindings for the Odin Programming
+Language to use my Original SDR Radios from SDRPlay.
+
+The bindings cover every public type, enum, struct, and function declared in
+the following C headers:
+
+    sdrplay_api.h             — Top-level API, device structs, function decls
+    sdrplay_api_callback.h    — Stream and event callback types
+    sdrplay_api_control.h     — AGC, DC offset, decimation control params
+    sdrplay_api_dev.h         — Device-level parameters (sample rate, sync, etc.)
+    sdrplay_api_rx_channel.h  — RX channel parameter aggregation
+    sdrplay_api_tuner.h       — Tuner parameters (frequency, gain, BW, IF, LO)
+    sdrplay_api_rsp1a.h       — RSP1A-specific parameters
+    sdrplay_api_rsp2.h        — RSP2-specific parameters
+    sdrplay_api_rspDuo.h      — RSPduo-specific parameters
+    sdrplay_api_rspDx.h       — RSPdx and RSPdx-R2 parameters
+
+Supported hardware:
+    RSP1 (hwVer=1), RSP1A (hwVer=255), RSP1B (hwVer=6), RSP2 (hwVer=2),
+    RSPduo (hwVer=3), RSPdx (hwVer=4), RSPdx-R2 (hwVer=7)
+
+
+2. PACKAGE AND IMPORTS
+--------------------------------------------------------------------------------
+
+The file declares `package main`, meaning it is compiled as part of the same
+package as main.odin, sdrplay_test.odin, and fm_receiver.odin. This allows all
+files to share the types and functions without explicit import statements.
+
+The only import is `core:fmt`, used by the check_err() helper for printing
+error messages to stderr.
+
+
+3. CONSTANTS (lines 23-59)
+--------------------------------------------------------------------------------
+
+All #define constants from the C headers are translated to Odin constant
+declarations (:: syntax). These include:
+
+  - SDRPLAY_API_VERSION (3.15)        — Compile-time API version check
+  - SDRPLAY_MAX_DEVICES (16)          — Maximum devices returnable by GetDevices
+  - SDRPLAY_MAX_TUNERS_PER_DEVICE (2) — Max tuners (RSPduo has 2)
+  - SDRPLAY_MAX_SER_NO_LEN (64)       — Serial number string buffer size
+  - MAX_BB_GR (59)                    — Maximum baseband gain reduction
+
+Device hardware IDs:
+  - SDRPLAY_RSP1_ID    = 1
+  - SDRPLAY_RSP1A_ID   = 255
+  - SDRPLAY_RSP2_ID    = 2
+  - SDRPLAY_RSPduo_ID  = 3
+  - SDRPLAY_RSPdx_ID   = 4
+  - SDRPLAY_RSP1B_ID   = 6
+  - SDRPLAY_RSPdxR2_ID = 7
+
+Sample rate constants (lines 56-59):
+  - SDRPLAY_FS_2MHZ   = 2,000,000.0    (2 MHz, default for FM radio)
+  - SDRPLAY_FS_8MHZ   = 8,000,000.0    (8 MHz)
+  - SDRPLAY_FS_10MHZ  = 10,000,000.0   (10 MHz, wideband capture)
+  - SDRPLAY_FS_MAX    = 10,660,000.0   (maximum sample rate for RSPdx)
+
+  The Bw_MHzT enum (analog bandwidth) maxes out at 8 MHz (BW_8_000) per the
+  C API. The sample rate (fsFreq.fsHz) is independent and can be set up to
+  SDRPLAY_FS_MAX. For 10 MHz sample rate, use BW_8_000 as the bandwidth.
+
+LNA state count constants for each hardware variant and frequency band
+(e.g., RSPDX_NUM_LNA_STATES = 28, RSPIA_NUM_LNA_STATES = 10, etc.).
+
+
+4. ENUM TYPES (lines 86-330)
+--------------------------------------------------------------------------------
+
+All C typedef enums are translated to Odin enum types with explicit backing
+type (i32 or u32) matching the C ABI. Key enums:
+
+  ErrT (enum i32) — 25 error codes from sdrplay_api_Success (0) through
+    sdrplay_api_InvalidServiceVersion (24).
+
+  ReasonForUpdateT (enum u32) — Bit-flag enum for sdrplay_api_Update(). Each
+    flag tells the API which parameter changed. Flags can be OR-ed together
+    using the | operator. Examples:
+      .Dev_Fs, .Dev_Ppm           — Device sample rate / PPM changed
+      .Tuner_Frf, .Tuner_Gr       — RF frequency / gain changed
+      .Ctrl_Agc, .Ctrl_Decimation — AGC / decimation changed
+      .RspDuo_BiasTControl etc.   — Device-specific hardware flags
+
+  ReasonForUpdateExtension1T (enum u32) — Extended update flags for RSPdx
+    and RSPduo-specific parameters (antenna, HDR, bias-T, notches).
+
+  Bw_MHzT (enum i32) — Bandwidth in kHz (200, 300, 600, 1536, 5000-8000).
+  If_kHzT (enum i32) — Intermediate frequency in kHz (0=Zero-IF, 450, 1620, 2048).
+  LoModeT (enum i32) — Local oscillator mode (Auto, 120/144/168 MHz).
+  TunerSelectT (enum i32) — Tuner A, B, Both, or Neither.
+  AgcControlT (enum i32) — AGC disable, 100Hz, 50Hz, 5Hz, or CTRL_EN.
+  RspDuoModeT (enum i32) — Single/Dual tuner, Master/Slave modes.
+  EventT (enum i32) — Event callback types (GainChange, PowerOverloadChange, etc.).
+
+
+5. STRUCT TYPES (lines 344-627)
+--------------------------------------------------------------------------------
+
+All C structs are translated to Odin structs with identical field names,
+types, and ordering to ensure binary compatibility with the C ABI.
+
+Important struct hierarchy:
+
+  DeviceT (lines 542-552)
+    The top-level device descriptor. Contains:
+    - SerNo: [64]u8     — Null-terminated serial number string
+    - hwVer: u8         — Hardware version (identifies RSP model)
+    - tuner: TunerSelectT — Which tuner is active
+    - rspDuoMode: RspDuoModeT — RSPduo operating mode
+    - valid: u8          — Whether device is available
+    - rspDuoSampleFreq: f64 — RSPduo dual-tuner sample rate
+    - dev: rawptr        — Opaque device handle (HANDLE in C)
+
+  DeviceParamsT (lines 534-540)
+    Pointer-based struct returned by sdrplay_api_GetDeviceParams():
+    - devParams: ^DevParamsT      — Device-level parameters
+    - rxChannelA: ^RxChannelParamsT — Tuner A parameters
+    - rxChannelB: ^RxChannelParamsT — Tuner B parameters (RSPduo only, nil for others)
+
+  DevParamsT (lines 508-521)
+    Device-level configuration:
+    - ppm: f64                  — Frequency correction in PPM
+    - fsFreq: FsFreqT           — Sample rate (fsHz) and sync settings
+    - mode: TransferModeT       — ISOCH or BULK USB transfer
+    - samplesPerPkt: u32        — Output: samples per USB packet
+    - rspDxParams: RspDxParamsT — RSPdx-specific device params (antenna, notches)
+    - (also rsp1aParams, rsp2Params, rspDuoParams)
+
+  RxChannelParamsT (lines 523-531)
+    Per-tuner configuration:
+    - tunerParams: TunerParamsT       — Frequency, gain, BW, IF, LO, DC offset
+    - ctrlParams: ControlParamsT     — AGC, decimation, DC/IQ correction
+    - rspDxTunerParams: RspDxTunerParamsT — RSPdx HDR bandwidth
+    - (also rsp1aTunerParams, rsp2TunerParams, rspDuoTunerParams)
+
+  CallbackFnsT (lines 620-626)
+    Structure passed to sdrplay_api_Init() containing three function pointers:
+    - StreamACbFn: StreamCallbackFn — Called with I/Q samples from tuner A
+    - StreamBCbFn: StreamCallbackFn — Called with I/Q samples from tuner B
+    - EventCbFn: EventCallbackFn   — Called on gain/overload/device events
+
+Callback function type aliases (lines 602-618):
+  StreamCallbackFn — proc "c" (xi, xq: [^]i16, params: ^StreamCbParamsT,
+                               numSamples: u32, reset: u32, cbContext: rawptr)
+  EventCallbackFn  — proc "c" (eventId: EventT, tuner: TunerSelectT,
+                               params: ^EventParamsT, cbContext: rawptr)
+
+The EventParamsT struct (line 593) uses Odin's #raw_union directive to match
+the C union, allowing the same memory to be interpreted as gainParams,
+powerOverloadParams, or rspDuoModeParams depending on the event type.
+
+
+6. FOREIGN LIBRARY DECLARATIONS (lines 631-657)
+--------------------------------------------------------------------------------
+
+The SDRplay shared library is linked via:
+
+    foreign import lib "system:libsdrplay_api.so"
+
+This tells the Odin compiler to link against libsdrplay_api.so (installed at
+/usr/lib/libsdrplay_api.so on this system, symlinked to libsdrplay_api.so.3.15).
+
+All 19 API functions are declared inside a `foreign lib` block with the "c"
+calling convention, matching the C function signatures exactly:
+
+Common API functions (11):
+  sdrplay_api_Open()              — Initialize the API (connects to service)
+  sdrplay_api_Close()             — Shut down the API
+  sdrplay_api_ApiVersion(^f32)    — Get API version (must match 3.15)
+  sdrplay_api_LockDeviceApi()     — Serialize multi-process device access
+  sdrplay_api_UnlockDeviceApi()   — Release the lock
+  sdrplay_api_GetDevices(...)     — Enumerate connected RSP devices
+  sdrplay_api_SelectDevice(...)   — Claim a device for exclusive use
+  sdrplay_api_ReleaseDevice(...)   — Release a claimed device
+  sdrplay_api_GetErrorString(...) — Convert error code to string
+  sdrplay_api_GetLastError(...)   — Get extended error info (file, line, msg)
+  sdrplay_api_DisableHeartbeat()  — Disable service heartbeat (pre-Select)
+
+Device API functions (8):
+  sdrplay_api_DebugEnable(...)           — Enable verbose/warning/error logging
+  sdrplay_api_GetDeviceParams(...)       — Get pointer to device parameter struct
+  sdrplay_api_Init(...)                  — Initialize streaming with callbacks
+  sdrplay_api_Uninit(...)                — Stop streaming and release resources
+  sdrplay_api_Update(...)               — Apply parameter changes at runtime
+  sdrplay_api_SwapRspDuoActiveTuner(..) — Switch RSPduo active tuner
+  sdrplay_api_SwapRspDuoDualTunerModeSampleRate(..)
+  sdrplay_api_SwapRspDuoMode(..)        — Change RSPduo operating mode
+
+
+7. HELPER FUNCTIONS (lines 665-745)
+--------------------------------------------------------------------------------
+
+Six helper functions are provided for convenience:
+
+  error_string(err: ErrT) -> string (line 665)
+    Wraps sdrplay_api_GetErrorString() and converts the cstring to an Odin
+    string. Returns "<null>" if the C function returns nil.
+
+  hw_version_name(hwVer: u8) -> string (line 673)
+    Maps a hardware version byte to a human-readable name ("RSP1", "RSP1A",
+    "RSP1B", "RSP2", "RSPduo", "RSPdx", "RSPdx-R2", or "Unknown").
+
+  bw_to_hz(bw: Bw_MHzT) -> f64 (line 692)
+    Converts a bandwidth enum to its value in Hz (e.g., .BW_0_200 -> 200000.0).
+    Uses #partial switch with a default case returning 0.0.
+    Note: The Bw_MHzT enum maxes out at 8 MHz (BW_8_000). For 10 MHz sample
+    rate, use BW_8_000 as the bandwidth and set fsHz separately.
+
+  hz_to_bw(hz: f64) -> Bw_MHzT (line 712)
+    Converts a sample rate in Hz to the nearest bandwidth enum.
+    For sample rates >= 8 MHz (including 10 MHz), returns BW_8_000
+    (the maximum available analog bandwidth).
+
+  serial_string(dev: ^DeviceT) -> string (line 725)
+    Extracts the null-terminated serial number from a DeviceT struct and
+    returns it as an Odin string.
+
+  check_err(err: ErrT, ctx: string) -> bool (line 737)
+    If err != .Success, prints an error message to stderr with the context
+    string and the error description, then returns false. Returns true on
+    success. Used throughout the codebase for concise error handling:
+        err := sdrplay_api_Open()
+        if !check_err(err, "sdrplay_api_Open") { return }
+
+
+8. COMPILATION
+--------------------------------------------------------------------------------
+
+Compiler: Odin dev-2025-12 (installed at /home/joao/odin/Odin/odin)
+
+Makefile (line-by-line):
+
+    all:
+        odin build . -out:sdrplay_bindings_test.exe -o:speed
+
+    run_tests:
+        ./sdrplay_bindings_test.exe
+
+    run_fm:
+        # 97.4 MHz FM Radio Comercial
+        ./sdrplay_bindings_test.exe -fm 97.4
+
+    clean:
+        rm -f ./sdrplay_bindings_test.exe
+
+
+Compilation command:
+    odin build . -out:sdrplay_bindings_test.exe -o:speed
+
+Parameters:
+  build .            — Compile all .odin files in the current directory as
+                       a single package (package main).
+  -out:<file>        — Output executable name.
+  -o:speed           — Optimize for speed (enables LLVM optimizations).
+
+The Odin compiler automatically:
+  - Links against libsdrplay_api.so (via the `foreign import lib` declaration)
+  - Links against libminiaudio.a (via the `import "vendor:miniaudio"` statement,
+    which includes the prebuilt static library at vendor/miniaudio/lib/)
+  - Links against libc (via `import "core:c"` in fm_receiver.odin)
+
+Runtime requirements:
+  - libsdrplay_api.so.3.15 must be in the library path (/usr/lib/)
+  - sdrplay_apiService systemd service must be running
+  - The RSP device must be connected via USB
+  - Audio output device must be available (for FM receiver mode)
+
+File summary:
+  sdrplay_api_bindings/sdrplay_api.odin  — 745 lines, API bindings (this file)
+  sdrplay_api_bindings/sdrplay_test.odin — 656 lines, hardware integration tests
+  sdrplay_api_bindings/fm_receiver.odin  — 648 lines, FM stereo radio receiver
+  main.odin                               —  35 lines, entry point with CLI argument parsing
+  Makefile                                —  12 lines, build/run/clean targets
+  Total                                   — 2096 lines of Odin code
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
