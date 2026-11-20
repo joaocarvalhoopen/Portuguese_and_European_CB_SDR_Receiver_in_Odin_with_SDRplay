@@ -16,7 +16,11 @@ Implements the complete **Portuguese (ANACOM QNAF)** and **European Harmonised (
 - **Dedicated-Thread Ping-Pong Double-Buffered Screen Engine (`2 × 256 KiB`) & Lock-Free Atomic SPSC Audio Ring Buffer (`262,144` frames)** — zero screen tearing, zero blocking terminal I/O on DSP/audio threads, zero ring-buffer underruns or overflows
 - **4 Progressive Band-Specific Indoor House & Communications Noise Filters** (with Level 3 recovering human voice down to **`-15 dB`** and Level 4 down to **`-20` to `-30 dB` below the noise floor**, plus exact **`0.0` zero-volume digital silence** during non-speech intervals and multi-tone heterodyne/whistle ANF when `notch on` is enabled)
 
----
+## Printscreen
+
+![./image_001.png](./image_001.png)
+
+![./image_002.png](./image_002.png)
 
 ## Build & Self-Test Verification
 
